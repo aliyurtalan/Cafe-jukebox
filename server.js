@@ -126,4 +126,5 @@ app.post('/player/finished', (req, res) => {
 app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
     try { await scanAndCacheSongs(); } catch (error) { console.error(error); }
+
 });
