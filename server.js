@@ -7,7 +7,7 @@ const mm = require('music-metadata');
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(__dirname));
 
 // YENİ: Müzik klasörünü internete açıyoruz (Dosya indirmek/çalmak için)
 // Artık 'siteadresi.com/music/sarki.mp3' diyerek müziğe erişilebilir.
@@ -128,3 +128,4 @@ app.listen(PORT, async () => {
     try { await scanAndCacheSongs(); } catch (error) { console.error(error); }
 
 });
+
