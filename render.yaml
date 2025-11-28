@@ -1,10 +1,10 @@
-services
-  - type web
-    name cafe-jukebox
-    env node
-    plan free
-    buildCommand npm install
-    startCommand node server.js
-    envVars
-      - key PORT
-        value 10000
+services:
+  - type: web
+    name: cafe-jukebox
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: 10000
