@@ -1,129 +1,206 @@
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
-const fs = require('fs').promises;
-const mm = require('music-metadata');
+document.addEventListener('DOMContentLoaded', () => {
+    checkAdminStatus();
+    loadSongs();
+    
+    // Eğer Yönetici ise müzik çalar sistemini başlat
+    if (isAdmin) {
+        initBrowserPlayer();
+    }
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+    fetchStatus();
+    setInterval(fetchStatus, 2000); 
 
-// YENİ: Müzik klasörünü internete açıyoruz (Dosya indirmek/çalmak için)
-// Artık 'siteadresi.com/music/sarki.mp3' diyerek müziğe erişilebilir.
-app.use('/music', express.static(path.join(__dirname, 'muzik')));
+    const searchInput = document.getElementById('search');
+    searchInput.addEventListener('input', () => {
+        filterSongs(searchInput.value.toLowerCase());
+    });
 
-const PORT = process.env.PORT || 3000;
-const MUSIC_DIR = path.join(__dirname, 'muzik');
+    // Buton eventleri
+    const prevBtn = document.getElementById('prevBtn');
+    if(prevBtn) prevBtn.addEventListener('click', () => sendPlayerCommand('/player/rewind'));
+    
+    const nextBtn = document.getElementById('nextBtn');
+    if(nextBtn) nextBtn.addEventListener('click', () => sendPlayerCommand('/player/next'));
+    
+    const playPauseBtn = document.getElementById('playPauseBtn');
+    if(playPauseBtn) playPauseBtn.addEventListener('click', () => sendPlayerCommand('/player/playpause'));
+});
 
-let nowPlaying = null;
-let queue = [];
-let isPlaying = false;
-let allSongsCache = [];
-let pendingCommand = null;
+let allSongs = [];
+let isAdmin = false;
+let browserAudio = null;
+let currentSongId = null;
 
-// --- DİĞER KODLAR AYNI KALIYOR ---
-// (Hız sınırı, admin kontrolü vs. aynen devam)
+function getTableNumber() {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('table') || 'Bilinmiyor';
+}
 
-const tableRequestTimes = {};
-const COOLDOWN_MINUTES = 10;
+function checkAdminStatus() {
+    if (getTableNumber().toLowerCase() === 'yonetici') {
+        document.body.classList.add('admin-view');
+        isAdmin = true;
+        console.log("Yönetici modu aktif. Müzik bu tarayıcıdan çalınacak.");
+        
+        const header = document.querySelector('.app-header');
+        const startBtn = document.createElement('button');
+        startBtn.textContent = "🔊 Hoparlörü Aktif Et (Tıkla)";
+        startBtn.className = "add-to-queue-btn";
+        startBtn.style.marginTop = "10px";
+        startBtn.onclick = function() {
+            const dummy = new Audio();
+            dummy.play().then(() => {
+                startBtn.textContent = "🔊 Hoparlör Aktif!";
+                startBtn.style.backgroundColor = "var(--spotify-green)";
+                startBtn.style.color = "black";
+            }).catch(e => console.log("Oynatma izni bekleniyor..."));
+        };
+        header.appendChild(startBtn);
+    }
+}
 
-async function scanAndCacheSongs() {
+// --- TARAYICI MÜZİK ÇALAR MANTIĞI ---
+function initBrowserPlayer() {
+    browserAudio = new Audio();
+    
+    browserAudio.addEventListener('ended', async () => {
+        console.log("Şarkı bitti, sıradakine geçiliyor...");
+        await fetch('/player/finished', { method: 'POST' });
+        fetchStatus();
+    });
+}
+
+async function handleAudioPlayback(song, isPlaying, command) {
+    if (!browserAudio) return;
+
+    // 1. Komutları İşle
+    if (command === 'rewind') {
+        browserAudio.currentTime = 0;
+    }
+
+    // 2. Yeni şarkı mı?
+    if (song && song.id !== currentSongId) {
+        console.log("Yeni şarkı yükleniyor:", song.title);
+        currentSongId = song.id;
+        browserAudio.src = `/music/${song.filename}`; 
+        try {
+            await browserAudio.play();
+        } catch (e) {
+            console.error("Otomatik oynatma engellendi.");
+        }
+    } else if (!song && currentSongId) {
+        browserAudio.pause();
+        currentSongId = null;
+    }
+
+    // 3. Oynat/Durdur Durumu
+    if (song && currentSongId === song.id) {
+        if (isPlaying && browserAudio.paused) {
+            browserAudio.play().catch(e => console.error("Oynatma hatası:", e));
+        } else if (!isPlaying && !browserAudio.paused) {
+            browserAudio.pause();
+        }
+    }
+}
+
+async function fetchStatus() {
     try {
-        const files = await fs.readdir(MUSIC_DIR);
-        const mp3s = files.filter(f => f.toLowerCase().endsWith('.mp3'));
-        const songs = [];
-        for (const file of mp3s) {
-            let title = file.replace('.mp3', ''), artist = 'Bilinmeyen Sanatçı';
-            try {
-                const metadata = await mm.parseFile(path.join(MUSIC_DIR, file));
-                title = metadata.common.title || title;
-                artist = metadata.common.artist || artist;
-            } catch (e) {}
-            // ÖNEMLİ: filename bilgisini de gönderiyoruz ki tarayıcı dosyayı bulabilsin
-            songs.push({ id: file, title, artist, filename: file });
+        const response = await fetch('/status');
+        const status = await response.json();
+        
+        updateNowPlayingUI(status.nowPlaying, status.isPlaying);
+        updateQueueUI(status.queue);
+
+        if (isAdmin) {
+            handleAudioPlayback(status.nowPlaying, status.isPlaying, status.command);
         }
-        allSongsCache = songs;
-        console.log(`${allSongsCache.length} şarkı tarandı.`);
-    } catch (err) { throw err; }
+
+    } catch (error) {}
 }
 
-function isRequestFromAdmin(req) {
-    const tableNumber = req.body.tableNumber;
-    return tableNumber && tableNumber.toLowerCase() === 'yonetici';
+async function sendPlayerCommand(endpoint) {
+    const tableNumber = getTableNumber();
+    try {
+        await fetch(endpoint, { 
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tableNumber: tableNumber }) 
+        });
+        fetchStatus();
+    } catch (error) { console.error(`Hata:`, error); }
 }
 
-function checkRateLimit(tableNumber) {
-    if (tableNumber.toLowerCase() === 'yonetici') return { allowed: true };
-    const now = new Date();
-    const lastRequestTime = tableRequestTimes[tableNumber];
-    if (lastRequestTime) {
-        const timeDiffMinutes = (now - lastRequestTime) / (1000 * 60);
-        if (timeDiffMinutes < COOLDOWN_MINUTES) {
-            const minutesToWait = Math.ceil(COOLDOWN_MINUTES - timeDiffMinutes);
-            return { allowed: false, message: `Lütfen ${minutesToWait} dakika bekleyin.` };
+function updateNowPlayingUI(song, isPlaying) {
+    const titleEl = document.getElementById('nowPlayingTitle');
+    const artistEl = document.getElementById('nowPlayingArtist');
+    const playPauseBtn = document.getElementById('playPauseBtn');
+    
+    if (song) {
+        titleEl.textContent = song.title;
+        if (song.requestedBy) artistEl.innerHTML = `${song.artist} <span class="track-requester-np">(İstek: ${song.requestedBy})</span>`;
+        else artistEl.textContent = song.artist;
+        if(playPauseBtn) {
+            playPauseBtn.innerHTML = isPlaying ? '⏸️' : '▶️';
+            playPauseBtn.title = isPlaying ? 'Duraklat' : 'Oynat';
         }
+    } else {
+        titleEl.textContent = '--';
+        artistEl.textContent = 'Jukebox Boşta';
+        if(playPauseBtn) playPauseBtn.innerHTML = '▶️';
     }
-    return { allowed: true };
 }
 
-app.get('/songs', (req, res) => res.json(allSongsCache));
+async function loadSongs() {
+    try {
+        const response = await fetch('/songs');
+        allSongs = await response.json();
+        displaySongs(allSongs);
+    } catch (error) {}
+}
 
-app.post('/queue', (req, res) => {
-    const { songId, tableNumber } = req.body;
-    if (!songId || !tableNumber) return res.status(400).json({ error: 'Eksik bilgi.' });
+function filterSongs(searchText) {
+    const filtered = allSongs.filter(s => s.title.toLowerCase().includes(searchText) || s.artist.toLowerCase().includes(searchText));
+    displaySongs(filtered);
+}
 
-    const rateLimit = checkRateLimit(tableNumber);
-    if (!rateLimit.allowed) return res.status(429).json({ error: rateLimit.message });
+function displaySongs(songs) {
+    const songList = document.getElementById('songList');
+    songList.innerHTML = '';
+    songs.forEach((song, index) => {
+        const li = document.createElement('li');
+        li.className = 'song-item';
+        li.innerHTML = `<div class="track-details"><span class="track-index">${index + 1}</span><div class="track-info"><span class="track-title">${song.title}</span><span class="track-artist">${song.artist}</span></div></div><button class="add-to-queue-btn" onclick="addSong(this, '${song.id}')">➕ Ekle</button>`;
+        songList.appendChild(li);
+    });
+}
 
-    const songData = allSongsCache.find(s => s.id === songId);
-    if (!songData) return res.status(404).json({ error: 'Şarkı bulunamadı' });
-    
-    const queueItem = { ...songData, requestedBy: tableNumber };
-    queue.push(queueItem);
-    
-    if (tableNumber.toLowerCase() !== 'yonetici') {
-        tableRequestTimes[tableNumber] = new Date();
+function updateQueueUI(queue) {
+    const queueList = document.getElementById('queueList');
+    queueList.innerHTML = '';
+    if (queue.length === 0) queueList.innerHTML = '<li class="song-item" style="color: var(--text-secondary);">Sırada şarkı yok...</li>';
+    else {
+        queue.forEach((song, index) => {
+            const li = document.createElement('li');
+            li.className = 'song-item';
+            li.innerHTML = `<div class="track-details"><span class="track-index">${index + 1}</span><div class="track-info"><span class="track-title">${song.title}</span><span class="track-artist">${song.artist}</span>${song.requestedBy ? `<span class="track-requester">(İstek: ${song.requestedBy})</span>` : ''}</div></div>`;
+            queueList.appendChild(li);
+        });
     }
+}
 
-    if (!nowPlaying) {
-        nowPlaying = queue.shift();
-        isPlaying = true;
-    }
-    res.status(201).json(queueItem);
-});
-
-app.get('/status', (req, res) => {
-    res.json({ nowPlaying, queue, isPlaying, command: pendingCommand });
-    pendingCommand = null;
-});
-
-// --- Admin Kontrolleri ---
-app.post('/player/next', (req, res) => {
-    if (!isRequestFromAdmin(req)) return res.status(403).json({ error: 'Yetkiniz yok.' });
-    if (queue.length > 0) { nowPlaying = queue.shift(); isPlaying = true; res.json(nowPlaying); }
-    else { nowPlaying = null; isPlaying = false; res.status(404).json({ error: 'Sıra bitti.' }); }
-});
-
-app.post('/player/rewind', (req, res) => {
-    if (!isRequestFromAdmin(req)) return res.status(403).json({ error: 'Yetkiniz yok.' });
-    if (nowPlaying) { pendingCommand = 'rewind'; res.json({ message: 'Rewind' }); }
-    else { res.status(404).json({ error: 'Yok' }); }
-});
-
-app.post('/player/playpause', (req, res) => {
-    if (!isRequestFromAdmin(req)) return res.status(403).json({ error: 'Yetkiniz yok.' });
-    if (nowPlaying) { isPlaying = !isPlaying; res.json({ isPlaying }); }
-    else { res.status(404).json({ error: 'Yok' }); }
-});
-
-// Browser Player şarkı bittiğinde bunu çağıracak
-app.post('/player/finished', (req, res) => {
-    if (queue.length > 0) { nowPlaying = queue.shift(); isPlaying = true; res.json(nowPlaying); }
-    else { nowPlaying = null; isPlaying = false; res.json({ message: 'Bitti' }); }
-});
-
-app.listen(PORT, async () => {
-    console.log(`Server running on port ${PORT}`);
-    try { await scanAndCacheSongs(); } catch (error) { console.error(error); }
-});
+async function addSong(buttonElement, songId) {
+    const tableNumber = getTableNumber();
+    try {
+        buttonElement.disabled = true;
+        const response = await fetch('/queue', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ songId: songId, tableNumber: tableNumber })
+        });
+        const result = await response.json();
+        if (response.ok) { buttonElement.textContent = '✅'; fetchStatus(); }
+        else if (response.status === 429) { alert(result.error); buttonElement.textContent = '⏱️'; }
+        else { throw new Error(result.error); }
+    } catch (error) { console.error('Hata:', error); buttonElement.textContent = '❌'; } 
+    finally { setTimeout(() => { buttonElement.textContent = '➕ Ekle'; buttonElement.disabled = false; }, 2000); }
+}
